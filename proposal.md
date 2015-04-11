@@ -42,37 +42,113 @@ One day, I realized that I can be selective about which test cases to run for a 
 
 ## Please describe an outline project architecture or an approach to it
 
-This project requires 2 components: one is an application (which we call "pickytest-gem") which generates code-to-test mappings and determines which test cases should be run for a given commit, and the other is a permanent storage (which we call "pickytest-storage") which stores the code-to-test mappings of the latest stable commit (because generating code-to-test mappings requires running all test cases, we cannot perform it for every test run in order to achieve the performance improvement we are seeking).
+This project consists of one gem (which we call "pickytest").
 
-### pickytest-gem
-
-The responsibilities of this gem are as follows:
-
-1. Generate code-to-test mappings for a given commit and register it to pickytest-storage (this will be a "base" commit to calculate test cases to run for a given commit)
-2. Determine which test cases should be run for a given commit, using the base commit registered to pickytest-storage
+1. Generate code-to-test mappings for a given commit
+2. Determine which test cases should be run for a given commit using (1) the code-to-test mappings for a "base" commit (likely to be the merge-base of the given commit and the HEAD of master branch) and (2) VCS diff information between the given commit and the "base" commit.
 
 Both can be run on any CIs. Users will be able to use it by only writing some setup code in, say, `spec_helper.rb` file. Running only selected test cases on CIs might be a bit tricky, so I might implement a feature to generate another directory named `selected_tests` or `selected_specs` which contains files with selected test cases. In that case, users can run all selected test cases easily.
 
-### pickytest-storage
+### Approaches
 
-The responsibilities of this storage are as follows:
+#### 1. Use Ruby 2.3.0-dev+ to use `Coverage.peek_result`
 
-1. Store "base" code-to-test mappings for repositories
-2. Provide APIs to register and get those "base" lines-to-test mappings
+This approach takes the same approach described in this article: [Predicting Test Failures | Tenderlovemaking](http://tenderlovemaking.com/2015/02/13/predicting-test-failues.html).
 
-This should be a simple storage. I am planning to make it a web application because everyone wants to run their tests on CIs. In that case, if there are no storage on the web, users should do one of the following:
+The overall idea is to peek in coverage information after each test run and calculate code-to-test mappings. The problem of this approach is that this needs `Coverage.peek_result` method, which is not present in current stable releases of Rubies. I noticed Ruby 2.3.0-dev has this method, so this approach forces users to either (1) patch Ruby themselves with the patch which add `Coverage.peek_result` method or (2) use Ruby 2.3.0-dev. In my opinion, this is not desirable comparing to the second approach.
 
-- Commit file(s) which contains code-to-test mappings to VCS
-- Prepare storage to store and get code-to-test mappings by themselves
+#### 2. Run each test case from scratch (requiring all files for every run)
 
-Which is not smart, so I am planning to provide a simple web storage along with pickytest-gem.
+The first approach needed `Coverage.peek_result` because of these 2 limitations:
+
+- To get coverage, Ruby source files should be required or loaded between `Coverage.start` and `Coverage.result`
+- `Coverage.result` clears out all the coverage information
+
+In code, the limitations looks like this:
+
+[a_method.rb](https://gist.github.com/Genki-S/f698a688ca4f6ef7c74b) (gist link)
+
+```
+def a_method
+  s = 0
+  10.times do |x|
+    s += x
+  end
+  s
+end
+```
+
+[experiment.rb](https://gist.github.com/Genki-S/cef9766b6ead493a2218) (gist link)
+
+```
+require 'coverage'
+
+Coverage.start
+require './a_method.rb'  # => true
+a_method
+p Coverage.result        # => {"/Users/.../a_method.rb"=>[1, 1, 1, 10, nil, 1, nil]}
+
+# Does not produce coverage because `Coverage.result` clears out the coverage
+# p Coverage.result      # coverage measurement is not enabled (RuntimeError)
+
+# Does not produce coverage because the file `a_method.rb` is not loaded
+Coverage.start
+a_method
+p Coverage.result        # => {"/Users/.../a_method.rb"=>[]}
+
+# Does not produce coverage because the file `a_method.rb` is not loaded
+Coverage.start
+require './a_method.rb'  # => false
+a_method
+p Coverage.result        # => {"/Users/.../a_method.rb"=>[]}
+
+# Unload `a_method.rb`
+$".delete_if { |s| s.include?('a_method.rb') }
+
+# Does produce coverage because the file `a_method.rb` is loaded
+Coverage.start
+require './a_method.rb'  # => true
+a_method
+p Coverage.result        # => {"/Users/.../a_method.rb"=>[1, 1, 1, 10, nil, 1, nil]}
+```
+
+This means we can generate code-to-test mappings in this procedure:
+
+1. start new Ruby process or unload all loaded files
+2. call `Coverage.start`
+3. `require` all files
+4. run single test case
+5. call `Coverage.result` and save code-to-test mappings
+6. loop 1 to 5 for all test cases
+7. combine all code-to-test mappings into one file
+
+This is expected to be extremely slow. But I think this is a bearable overhead to reduce test execution time later.
+
+For quick experiment, I executed a single test in Rails repository and benchmarked it. The result was like this:
+
+(machine spec)
+```
+MacBook Pro (Retina, 13-inch, Late 2013)
+Processor 2.8 GHz Intel Core i7
+Memory 16 GB 1600 MHz DDR3
+```
+
+(benchmark)
+```
+$ n=0; time ( while (( n++ < 10000 )); do ruby -w -Itest test/mail_layout_test.rb -n test_explicit_class_layout; done )
+119.15s user 24.78s system 97% cpu 2:27.68 total
+```
+
+119.15s for 100 execution, so it took roughly 1.2s for this one test case to run.
+
+Let's say test preparation (like loading files) costs 1.2 seconds and one test case run costs C seconds on average in Rails repository. Because Rails has about 11000 test cases if I get it right (`$ grep -R 'def test_' . | wc -l` resulted in 10758), it will take at least 3.5 hours ((11000 * 1.2).to_f / 60 / 60 = 3.67) for only test preparations. Total time will hugely depend on the constant C, but I believe it will not exceed 24 hours.
 
 ## Give us details about the milestones for this project
 
 - May 25: Project Start
-- June 1: pickytest-gem prototype (generate code-to-test mappings, select test cases given code-to-test mappings and a commit) is ready
-- June 8: pickytest-storage prototype (store code-to-test mappings for repositories) is ready
-- June 15: pickytest ecosystem (pickytest-gem and pickytest-storage working seemlessly) is ready
+- June 1: Decide which approach to take
+- June 8: pickytest prototype (generate code-to-test mappings, select test cases given code-to-test mappings and a commit) is ready
+- June 9-15: Try using it in some repositories and improve
 - June 16: Beta release
 - June 16-30: Gather feedbacks and improve on them
 - July 1-14: Plan an experiment which can estimate how effective this approach is
